@@ -116,6 +116,7 @@ use crate::diagnostics::division_by_zero;
 use crate::diagnostics::exponent_not_in_range;
 use crate::diagnostics::exponentiation_requirement;
 use crate::diagnostics::float_not_in_range;
+use crate::diagnostics::function_call_failed;
 use crate::diagnostics::integer_negation_not_in_range;
 use crate::diagnostics::integer_not_in_range;
 use crate::diagnostics::map_key_not_found;
@@ -525,7 +526,7 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
                 let value = self.evaluate_expr(&expr).await?;
                 let mut expected: Type = value.ty();
                 let mut expected_span = expr.span();
-                values.push(value);
+                values.push((value, expr.span()));
 
                 // Ensure the remaining element types share a common type
                 for expr in elements {
@@ -550,8 +551,21 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
                         }
                     }
 
-                    values.push(value);
+                    values.push((value, expr.span()));
                 }
+
+                // Coerce all elements to the common type, as earlier elements
+                // may not have been coerced to it (e.g. `["a",
+                // 1]`)
+                let values = values
+                    .into_iter()
+                    .map(|(value, span)| {
+                        let actual = value.ty();
+                        value.coerce(Some(&self.context), &expected).map_err(|e| {
+                            runtime_type_mismatch(e, &expected, expected_span, &actual, span)
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Diagnostic>>()?;
 
                 (expected, values)
             }
@@ -610,7 +624,11 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
                     }
                 };
 
-                elements.push((key, expected_value));
+                elements.push((
+                    key,
+                    expected_value,
+                    (expected_key_span, expected_value_span),
+                ));
 
                 // Ensure the remaining items types share common types
                 for item in items {
@@ -677,8 +695,46 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
                         _ => panic!("key {actual_key} is not primitive, but had a common type"),
                     };
 
-                    elements.push((actual_key, actual_value));
+                    elements.push((actual_key, actual_value, (key.span(), value.span())));
                 }
+
+                // Coerce all keys and values to the common types, as earlier
+                // items may not have been coerced to them (e.g.
+                // `{"a": "b", "c": 1}`)
+                let key_ty = expected_key_ty.clone();
+                let value_ty = expected_value_ty.clone();
+                let elements = elements
+                    .into_iter()
+                    .map(|(key, value, (key_span, value_span))| {
+                        let actual_key_ty = key.ty();
+                        let key = Value::from(key)
+                            .coerce(Some(&self.context), &key_ty)
+                            .map_err(|e| {
+                                runtime_type_mismatch(
+                                    e,
+                                    &key_ty,
+                                    expected_key_span,
+                                    &actual_key_ty,
+                                    key_span,
+                                )
+                            })?;
+                        let actual_value_ty = value.ty();
+                        let value = value.coerce(Some(&self.context), &value_ty).map_err(|e| {
+                            runtime_type_mismatch(
+                                e,
+                                &value_ty,
+                                expected_value_span,
+                                &actual_value_ty,
+                                value_span,
+                            )
+                        })?;
+
+                        match key {
+                            Value::Primitive(key) => Ok((key, value)),
+                            _ => panic!("key {key} is not primitive, but had a common type"),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, Diagnostic>>()?;
 
                 (expected_key_ty, expected_value_ty, elements)
             }
@@ -947,6 +1003,26 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
         Ok((name, value))
     }
 
+    /// Coerces a value to `Boolean`, distinguishing a static type mismatch from
+    /// a runtime coercion failure.
+    fn coerce_boolean(
+        &self,
+        value: Value,
+        span: Span,
+        mismatch: impl FnOnce(&Type, Span) -> Diagnostic,
+    ) -> Result<bool, Diagnostic> {
+        let ty = value.ty();
+        let target = Type::from(PrimitiveType::Boolean);
+        if !ty.is_coercible_to(&target) {
+            return Err(mismatch(&ty, span));
+        }
+
+        Ok(value
+            .coerce(Some(&self.context), &target)
+            .map_err(|e| runtime_type_mismatch(e, &target, span, &ty, span))?
+            .unwrap_boolean())
+    }
+
     /// Evaluates an `if` expression.
     async fn evaluate_if_expr(&mut self, expr: &IfExpr<SyntaxNode>) -> Result<Value, Diagnostic> {
         /// Used to translate an expression evaluation context to an expression
@@ -1004,11 +1080,8 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
         // false expression, depending on the result of the conditional
         // expression
         let cond = self.evaluate_expr(&cond_expr).await?;
-        let (value, true_ty, false_ty) = if cond
-            .coerce(Some(&self.context), &PrimitiveType::Boolean.into())
-            .map_err(|_| if_conditional_mismatch(&cond.ty(), cond_expr.span()))?
-            .unwrap_boolean()
-        {
+        let cond = self.coerce_boolean(cond, cond_expr.span(), if_conditional_mismatch)?;
+        let (value, true_ty, false_ty) = if cond {
             // Evaluate the `true` expression and calculate the type of the
             // `false` expression
             let value = self.evaluate_expr(&true_expr).await?;
@@ -1054,9 +1127,15 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
             type_mismatch(&true_ty, true_expr.span(), &false_ty, false_expr.span())
         })?;
 
-        Ok(value
+        let span = if cond {
+            true_expr.span()
+        } else {
+            false_expr.span()
+        };
+
+        value
             .coerce(Some(&self.context), &ty)
-            .expect("coercion should not fail"))
+            .map_err(|e| Diagnostic::error(format!("{e:#}")).with_highlight(span))
     }
 
     /// Evaluates a `logical not` expression.
@@ -1067,11 +1146,7 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
         // The operand should be a boolean
         let operand = expr.operand();
         let value = self.evaluate_expr(&operand).await?;
-        Ok((!value
-            .coerce(Some(&self.context), &PrimitiveType::Boolean.into())
-            .map_err(|_| logical_not_mismatch(&value.ty(), operand.span()))?
-            .unwrap_boolean())
-        .into())
+        Ok((!self.coerce_boolean(value, operand.span(), logical_not_mismatch)?).into())
     }
 
     /// Evaluates an unwrap expression.
@@ -1118,9 +1193,15 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
                 .into());
         }
 
-        // If the type is `Float`, treat it as `Float`
-        if ty.eq(&PrimitiveType::Float.into()) {
-            let value = value.unwrap_float();
+        // Otherwise, coerce to `Float` if possible
+        let float_ty = Type::from(PrimitiveType::Float);
+        if ty.is_coercible_to(&float_ty) {
+            let value = value
+                .coerce(Some(&self.context), &float_ty)
+                .map_err(|e| {
+                    runtime_type_mismatch(e, &float_ty, operand.span(), &ty, operand.span())
+                })?
+                .unwrap_float();
             return Ok((-value).into());
         }
 
@@ -1142,20 +1223,16 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
 
         // Evaluate the left-hand side first
         let left = self.evaluate_expr(&lhs).await?;
-        if left
-            .coerce(Some(&self.context), &PrimitiveType::Boolean.into())
-            .map_err(|_| logical_or_mismatch(&left.ty(), lhs.span()))?
-            .unwrap_boolean()
-        {
+        if self.coerce_boolean(left, lhs.span(), logical_or_mismatch)? {
             // Short-circuit if the left-hand side is true
             return Ok(true.into());
         }
 
         // Otherwise, evaluate the right-hand side
         let right = self.evaluate_expr(&rhs).await?;
-        right
-            .coerce(Some(&self.context), &PrimitiveType::Boolean.into())
-            .map_err(|_| logical_or_mismatch(&right.ty(), rhs.span()))
+        Ok(self
+            .coerce_boolean(right, rhs.span(), logical_or_mismatch)?
+            .into())
     }
 
     /// Evaluates a `logical and` expression.
@@ -1167,20 +1244,16 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
 
         // Evaluate the left-hand side first
         let left = self.evaluate_expr(&lhs).await?;
-        if !left
-            .coerce(Some(&self.context), &PrimitiveType::Boolean.into())
-            .map_err(|_| logical_and_mismatch(&left.ty(), lhs.span()))?
-            .unwrap_boolean()
-        {
+        if !self.coerce_boolean(left, lhs.span(), logical_and_mismatch)? {
             // Short-circuit if the left-hand side is false
             return Ok(false.into());
         }
 
         // Otherwise, evaluate the right-hand side
         let right = self.evaluate_expr(&rhs).await?;
-        right
-            .coerce(Some(&self.context), &PrimitiveType::Boolean.into())
-            .map_err(|_| logical_and_mismatch(&right.ty(), rhs.span()))
+        Ok(self
+            .coerce_boolean(right, rhs.span(), logical_and_mismatch)?
+            .into())
     }
 
     /// Evaluates a comparison expression.
@@ -1193,6 +1266,38 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
     ) -> Result<Value, Diagnostic> {
         let left = self.evaluate_expr(lhs).await?;
         let right = self.evaluate_expr(rhs).await?;
+
+        let (left, right) = match (&left, &right) {
+            (
+                Value::Primitive(PrimitiveValue::String(_)),
+                Value::Primitive(
+                    PrimitiveValue::Boolean(_)
+                    | PrimitiveValue::Integer(_)
+                    | PrimitiveValue::Float(_),
+                ),
+            ) => {
+                let target = right.ty();
+                let coerced = left.coerce(Some(&self.context), &target).map_err(|e| {
+                    runtime_type_mismatch(e, &target, rhs.span(), &left.ty(), lhs.span())
+                })?;
+                (coerced, right)
+            }
+            (
+                Value::Primitive(
+                    PrimitiveValue::Boolean(_)
+                    | PrimitiveValue::Integer(_)
+                    | PrimitiveValue::Float(_),
+                ),
+                Value::Primitive(PrimitiveValue::String(_)),
+            ) => {
+                let target = left.ty();
+                let coerced = right.coerce(Some(&self.context), &target).map_err(|e| {
+                    runtime_type_mismatch(e, &target, lhs.span(), &right.ty(), rhs.span())
+                })?;
+                (left, coerced)
+            }
+            _ => (left, right),
+        };
 
         match op {
             ComparisonOperator::Equality => Value::equals(&left, &right),
@@ -1312,46 +1417,31 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
 
         let left = self.evaluate_expr(lhs).await?;
         let right = self.evaluate_expr(rhs).await?;
+
         match (&left, &right) {
             (
                 Value::Primitive(PrimitiveValue::Integer(left)),
                 Value::Primitive(PrimitiveValue::Integer(right)),
-            ) => Some(int_numeric_op(op, *left, *right, span, rhs.span())?.into()),
-            (
-                Value::Primitive(PrimitiveValue::Float(left)),
-                Value::Primitive(PrimitiveValue::Float(right)),
-            ) => Some(float_numeric_op(op, left.0, right.0, span, rhs.span())?.into()),
-            (
-                Value::Primitive(PrimitiveValue::Integer(left)),
-                Value::Primitive(PrimitiveValue::Float(right)),
-            ) => Some(float_numeric_op(op, *left as f64, right.0, span, rhs.span())?.into()),
-            (
-                Value::Primitive(PrimitiveValue::Float(left)),
-                Value::Primitive(PrimitiveValue::Integer(right)),
-            ) => Some(float_numeric_op(op, left.0, *right as f64, span, rhs.span())?.into()),
+            ) => return Ok(int_numeric_op(op, *left, *right, span, rhs.span())?.into()),
             (Value::Primitive(PrimitiveValue::String(left)), Value::Primitive(right))
                 if op == NumericOperator::Addition
                     && !matches!(right, PrimitiveValue::Boolean(_)) =>
             {
-                Some(
-                    PrimitiveValue::new_string(format!(
-                        "{left}{right}",
-                        right = right.raw(Some(&self.context))
-                    ))
-                    .into(),
-                )
+                return Ok(PrimitiveValue::new_string(format!(
+                    "{left}{right}",
+                    right = right.raw(Some(&self.context))
+                ))
+                .into());
             }
             (Value::Primitive(left), Value::Primitive(PrimitiveValue::String(right)))
                 if op == NumericOperator::Addition
                     && !matches!(left, PrimitiveValue::Boolean(_)) =>
             {
-                Some(
-                    PrimitiveValue::new_string(format!(
-                        "{left}{right}",
-                        left = left.raw(Some(&self.context))
-                    ))
-                    .into(),
-                )
+                return Ok(PrimitiveValue::new_string(format!(
+                    "{left}{right}",
+                    left = left.raw(Some(&self.context))
+                ))
+                .into());
             }
             (Value::Primitive(PrimitiveValue::String(_)), Value::None(_))
             | (Value::None(_), Value::Primitive(PrimitiveValue::String(_)))
@@ -1359,11 +1449,35 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
             {
                 // Allow string concatenation with `None` in placeholders, which
                 // evaluates to `None`
-                Some(Value::new_none(Type::None))
+                return Ok(Value::new_none(Type::None));
             }
-            _ => None,
+            _ => {}
         }
-        .ok_or_else(|| numeric_mismatch(op, span, &left.ty(), lhs.span(), &right.ty(), rhs.span()))
+
+        let float_ty = Type::from(PrimitiveType::Float);
+        let (left_ty, right_ty) = (left.ty(), right.ty());
+        if left_ty.is_coercible_to(&float_ty) && right_ty.is_coercible_to(&float_ty) {
+            let left = left
+                .coerce(Some(&self.context), &float_ty)
+                .map_err(|e| runtime_type_mismatch(e, &float_ty, rhs.span(), &left_ty, lhs.span()))?
+                .unwrap_float();
+            let right = right
+                .coerce(Some(&self.context), &float_ty)
+                .map_err(|e| {
+                    runtime_type_mismatch(e, &float_ty, lhs.span(), &right_ty, rhs.span())
+                })?
+                .unwrap_float();
+            return Ok(float_numeric_op(op, left, right, span, rhs.span())?.into());
+        }
+
+        Err(numeric_mismatch(
+            op,
+            span,
+            &left_ty,
+            lhs.span(),
+            &right_ty,
+            rhs.span(),
+        ))
     }
 
     /// Evaluates a call expression.
@@ -1392,10 +1506,44 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
                 // First bind the function based on the argument types, then
                 // dispatch the call
                 let types = &types[..count.min(MAX_PARAMETERS)];
-                let arguments = &arguments[..count.min(MAX_PARAMETERS)];
+                let arguments = &mut arguments[..count.min(MAX_PARAMETERS)];
                 if count <= MAX_PARAMETERS {
                     match f.bind(self.context.version(), types) {
                         Ok(binding) => {
+                            // Coerce `String` arguments to `Int`, `Float`, or
+                            // `Boolean` parameters up front so that an invalid
+                            // value reports an error and implementations
+                            // receive the coerced value
+                            for (argument, ty) in arguments
+                                .iter_mut()
+                                .zip(binding.signature().realize_parameter_types(types))
+                            {
+                                let Some(ty) = ty else { continue };
+                                if argument.value.as_string().is_none()
+                                    || !matches!(
+                                        ty.as_primitive(),
+                                        Some(
+                                            PrimitiveType::Integer
+                                                | PrimitiveType::Float
+                                                | PrimitiveType::Boolean
+                                        )
+                                    )
+                                {
+                                    continue;
+                                }
+
+                                argument.value = argument
+                                    .value
+                                    .coerce(Some(&self.context), &ty)
+                                    .map_err(|e| {
+                                        function_call_failed(
+                                            target.text(),
+                                            format!("{e:#}"),
+                                            argument.span,
+                                        )
+                                    })?;
+                            }
+
                             let context = CallContext::new(
                                 &mut self.context,
                                 target.span(),
@@ -1474,25 +1622,31 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
     ) -> Result<Value, Diagnostic> {
         let (target, index) = expr.operands();
         match self.evaluate_expr(&target).await? {
-            Value::Compound(CompoundValue::Array(array)) => match self.evaluate_expr(&index).await?
-            {
-                Value::Primitive(PrimitiveValue::Integer(i)) => {
-                    match i.try_into().map(|i: usize| array.as_slice().get(i)) {
-                        Ok(Some(value)) => Ok(value.clone()),
-                        _ => Err(array_index_out_of_range(
-                            i,
-                            array.len(),
-                            index.span(),
-                            target.span(),
-                        )),
-                    }
+            Value::Compound(CompoundValue::Array(array)) => {
+                let index_ty = Type::from(PrimitiveType::Integer);
+                let index_value = self.evaluate_expr(&index).await?;
+                let actual_ty = index_value.ty();
+                if !actual_ty.is_coercible_to(&index_ty) {
+                    return Err(index_type_mismatch(&index_ty, &actual_ty, index.span()));
                 }
-                value => Err(index_type_mismatch(
-                    &PrimitiveType::Integer.into(),
-                    &value.ty(),
-                    index.span(),
-                )),
-            },
+
+                let i = index_value
+                    .coerce(Some(&self.context), &index_ty)
+                    .map_err(|e| {
+                        runtime_type_mismatch(e, &index_ty, index.span(), &actual_ty, index.span())
+                    })?
+                    .unwrap_integer();
+
+                match i.try_into().map(|i: usize| array.as_slice().get(i)) {
+                    Ok(Some(value)) => Ok(value.clone()),
+                    _ => Err(array_index_out_of_range(
+                        i,
+                        array.len(),
+                        index.span(),
+                        target.span(),
+                    )),
+                }
+            }
             Value::Compound(CompoundValue::Map(map)) => {
                 let key_type = map
                     .ty()
@@ -1502,12 +1656,21 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
                     .as_primitive()
                     .ok_or_else(|| map_key_not_found(index.span()))?;
 
-                let key = match self.evaluate_expr(&index).await? {
-                    Value::Primitive(key) if key.ty().is_coercible_to(&key_type.into()) => key,
-                    value => {
-                        return Err(index_type_mismatch(
-                            &key_type.into(),
-                            &value.ty(),
+                let key_ty = Type::from(key_type);
+                let key_value = self.evaluate_expr(&index).await?;
+                if !key_value.ty().is_coercible_to(&key_ty) {
+                    return Err(index_type_mismatch(&key_ty, &key_value.ty(), index.span()));
+                }
+
+                let key = match key_value.coerce(Some(&self.context), &key_ty) {
+                    Ok(Value::Primitive(key)) => key,
+                    Ok(_) => unreachable!("coerced map key should be primitive"),
+                    Err(e) => {
+                        return Err(runtime_type_mismatch(
+                            e,
+                            &key_ty,
+                            index.span(),
+                            &key_value.ty(),
                             index.span(),
                         ));
                     }
@@ -1570,7 +1733,13 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
                     let value = self
                         .context()
                         .enum_choice_value(v.name(), name.text())
-                        .map_err(|_| not_an_enum_choice(v.name(), &name))?;
+                        .map_err(|e| {
+                            if enum_ty.choices().iter().any(|c| c == name.text()) {
+                                e.with_highlight(name.span())
+                            } else {
+                                not_an_enum_choice(v.name(), &name)
+                            }
+                        })?;
 
                     let choice = EnumChoice::new(enum_ty.clone(), name.text(), value);
                     Ok(Value::Compound(CompoundValue::EnumChoice(choice)))
@@ -1602,42 +1771,28 @@ macro_rules! match_literal_value {
 
 /// Parses a constant value from an AST expression and target type.
 ///
-/// Returns `None` if the value cannot be parsed as a constant value.
+/// Returns `None` if the value cannot be parsed as a constant value or if it
+/// cannot be coerced to the target type (e.g. a `String` that does not contain
+/// a valid `Int`).
 ///
 /// # Panics
 ///
-/// Panics if any of the expressions do not match their expected literal type
-/// _or_ if the provided value does not coerce to the inner enum type. Both of
-/// these issues should be caught at analysis time.
+/// Panics if any of the expressions do not match their expected literal type.
+/// This should be caught at analysis time.
 pub(super) fn parse_constant_value(target_ty: &Type, expr: &Expr) -> Option<Value> {
     let value = match target_ty {
-        Type::Primitive(PrimitiveType::Boolean, _) => {
-            match_literal_value!(expr, Boolean(b), PrimitiveType::Boolean);
-            Some(Value::Primitive(PrimitiveValue::Boolean(b.value())))
-        }
-        Type::Primitive(PrimitiveType::Integer, _) => {
-            match_literal_value!(expr, Integer(i), PrimitiveType::Integer);
-            Some(Value::Primitive(PrimitiveValue::Integer(i.value()?)))
-        }
-        Type::Primitive(PrimitiveType::Float, _) => {
-            match_literal_value!(expr, Float(f), PrimitiveType::Float);
-            Some(Value::Primitive(PrimitiveValue::Float(f.value()?.into())))
-        }
-        Type::Primitive(PrimitiveType::String, _) => {
-            match_literal_value!(expr, String(s), PrimitiveType::String);
-            Some(Value::Primitive(PrimitiveValue::new_string(
-                s.text()?.text(),
-            )))
-        }
-        Type::Primitive(PrimitiveType::File, _) => {
-            match_literal_value!(expr, String(s), PrimitiveType::File);
-            Some(Value::Primitive(PrimitiveValue::new_file(s.text()?.text())))
-        }
-        Type::Primitive(PrimitiveType::Directory, _) => {
-            match_literal_value!(expr, String(s), PrimitiveType::Directory);
-            Some(Value::Primitive(PrimitiveValue::new_directory(
-                s.text()?.text(),
-            )))
+        Type::Primitive(..) => {
+            let Expr::Literal(literal) = expr else {
+                panic!("expected a literal expression for {target_ty:#}");
+            };
+
+            Some(Value::Primitive(match literal {
+                LiteralExpr::Boolean(b) => PrimitiveValue::Boolean(b.value()),
+                LiteralExpr::Integer(i) => PrimitiveValue::Integer(i.value()?),
+                LiteralExpr::Float(f) => PrimitiveValue::Float(f.value()?.into()),
+                LiteralExpr::String(s) => PrimitiveValue::new_string(s.text()?.text()),
+                _ => panic!("expected a primitive literal expression for {target_ty:#}"),
+            }))
         }
         Type::Compound(CompoundType::Array(array_ty), _) => {
             match_literal_value!(expr, Array(arr), CompoundType::Array);
@@ -1720,8 +1875,7 @@ pub(super) fn parse_constant_value(target_ty: &Type, expr: &Expr) -> Option<Valu
         _ => None,
     }?;
 
-    // SAFETY: see the panic notice for this function.
-    Some(value.coerce(None, target_ty).unwrap())
+    value.coerce(None, target_ty).ok()
 }
 
 #[cfg(test)]
@@ -3847,13 +4001,13 @@ pub(crate) mod tests {
             "function `min` requires no more than 2 arguments but 10 were supplied"
         );
 
-        let diagnostic = eval_v1_expr(&env, V1::One, "min('1', 2)")
+        let diagnostic = eval_v1_expr(&env, V1::One, "min(true, 2)")
             .await
             .unwrap_err();
         assert_eq!(
             diagnostic.message(),
             "type mismatch: argument to function `min` expects type `Int` or type `Float`, but \
-             found type `String`"
+             found type `Boolean`"
         );
     }
 
@@ -3890,12 +4044,29 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(diagnostic.message(), "array index 10 is out of range");
 
+        let value = eval_v1_expr(&env, V1::Zero, r#"foo["1"]"#).await.unwrap();
+        assert_eq!(value.unwrap_integer(), 2);
+
         let diagnostic = eval_v1_expr(&env, V1::Zero, r#"foo["10"]"#)
+            .await
+            .unwrap_err();
+        assert_eq!(diagnostic.message(), "array index 10 is out of range");
+
+        let diagnostic = eval_v1_expr(&env, V1::Zero, r#"foo[true]"#)
             .await
             .unwrap_err();
         assert_eq!(
             diagnostic.message(),
-            "type mismatch: expected index to be type `Int`, but found type `String`"
+            "type mismatch: expected index to be type `Int`, but found type `Boolean`"
+        );
+
+        let diagnostic = eval_v1_expr(&env, V1::Zero, r#"foo["abc"]"#)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            diagnostic.message(),
+            "type mismatch: expected type `Int`, but found type `String`: cannot coerce type \
+             `String` to type `Int`: `abc` is not a valid integer"
         );
 
         let value = eval_v1_expr(&env, V1::Zero, r#"bar["foo"]"#).await.unwrap();
@@ -4016,6 +4187,113 @@ pub(crate) mod tests {
         assert_eq!(
             diagnostic.message(),
             "the map does not contain an entry for the specified key"
+        );
+    }
+
+    #[tokio::test]
+    async fn string_operator_coercions() {
+        let env = TestEnv::default();
+
+        approx::assert_relative_eq!(
+            eval_v1_expr(&env, V1::Two, r#"-"1.5""#)
+                .await
+                .unwrap()
+                .unwrap_float(),
+            -1.5
+        );
+        assert!(eval_v1_expr(&env, V1::Two, r#"-"bad""#).await.is_err());
+
+        approx::assert_relative_eq!(
+            eval_v1_expr(&env, V1::Two, r#""5" - 2"#)
+                .await
+                .unwrap()
+                .unwrap_float(),
+            3.0
+        );
+        approx::assert_relative_eq!(
+            eval_v1_expr(&env, V1::Two, r#""2" * "3""#)
+                .await
+                .unwrap()
+                .unwrap_float(),
+            6.0
+        );
+        assert!(eval_v1_expr(&env, V1::Two, r#""5" - "bad""#).await.is_err());
+        assert_eq!(
+            eval_v1_expr(&env, V1::Two, r#""1" + 2"#)
+                .await
+                .unwrap()
+                .unwrap_string()
+                .as_str(),
+            "12"
+        );
+        assert_eq!(
+            eval_v1_expr(&env, V1::Two, r#""1" + "2""#)
+                .await
+                .unwrap()
+                .unwrap_string()
+                .as_str(),
+            "12"
+        );
+
+        assert!(
+            eval_v1_expr(&env, V1::Two, r#"1 == "1""#)
+                .await
+                .unwrap()
+                .unwrap_boolean()
+        );
+        assert!(
+            eval_v1_expr(&env, V1::Two, r#""1" < 2"#)
+                .await
+                .unwrap()
+                .unwrap_boolean()
+        );
+        assert!(
+            eval_v1_expr(&env, V1::Two, r#"true == "TRUE""#)
+                .await
+                .unwrap()
+                .unwrap_boolean()
+        );
+        assert!(
+            !eval_v1_expr(&env, V1::Two, r#""a" == "b""#)
+                .await
+                .unwrap()
+                .unwrap_boolean()
+        );
+        assert!(eval_v1_expr(&env, V1::Two, r#"1 == "bad""#).await.is_err());
+
+        assert_eq!(
+            eval_v1_expr(&env, V1::Two, r#"{ 1: "one" }["1"]"#)
+                .await
+                .unwrap()
+                .unwrap_string()
+                .as_str(),
+            "one"
+        );
+        assert!(
+            eval_v1_expr(&env, V1::Two, r#"{ 1: "one" }["bad"]"#)
+                .await
+                .is_err()
+        );
+
+        let diagnostic = eval_v1_expr(&env, V1::Two, r#"!"bad""#).await.unwrap_err();
+        assert_eq!(
+            diagnostic.message(),
+            "type mismatch: expected type `Boolean`, but found type `String`: cannot coerce type \
+             `String` to type `Boolean`: `bad` is not a valid boolean"
+        );
+        let diagnostic = eval_v1_expr(&env, V1::Two, r#"if "bad" then 1 else 2"#)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            diagnostic.message(),
+            "type mismatch: expected type `Boolean`, but found type `String`: cannot coerce type \
+             `String` to type `Boolean`: `bad` is not a valid boolean"
+        );
+        assert!(
+            eval_v1_expr(&env, V1::Two, r#""true" && !"false""#)
+                .await
+                .unwrap()
+                .unwrap_boolean()
         );
     }
 }
